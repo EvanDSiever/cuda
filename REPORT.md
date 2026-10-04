@@ -7,14 +7,28 @@
 
 - **Detected GPU Model:** NVIDIA GeForce RTX 2060
 - **Driver Version:** Windows WDDM 617.14 / WSL 615.78.02
-- **CUDA Driver API Support:** CUDA 13.4
-- **Global Memory:** 6.0 GiB GDDR6
-- **Compute Capability:** 7.5 (Turing Architecture)
-- **Compiler Status:** `nvcc` missing from system PATH (installation guidance provided).
+- **CUDA Toolkit Version:** CUDA 12.4 (`nvcc` release 12.4, V12.4.131)
+- **Streaming Multiprocessors (SMs):** 30 SMs
+- **Warp Size:** 32 threads
+- **Max Threads Per Block:** 1024
+- **Shared Memory Per Block:** 49,152 bytes (48 KiB)
+- **Global Memory:** 6.00 GiB GDDR6
+- **Compiler Flags:** `-std=c++17 -O3 -lineinfo -arch=native`
 
 ---
 
 ## 2. Exercise 1 Analysis: Inspect the Available GPU
+
+### Hardware Query Output (`./device_info`):
+```text
+Device: NVIDIA GeForce RTX 2060
+Compute capability: 7.5
+SM count: 30
+Warp size: 32
+Maximum threads per block: 1024
+Global memory: 6.00 GiB
+Shared memory per block: 49152 bytes
+```
 
 ### Questions & Findings:
 1. **Which reported limit constrains a 16-by-16-thread block?**
@@ -22,7 +36,7 @@
    - On NVIDIA GPUs (including Compute Capability 7.5), the relevant hardware limits are:
      - `maxThreadsPerBlock`: 1024 threads.
      - `maxThreadsDim`: `[1024, 1024, 64]`.
-   - Since $256 \le 1024$, and both dimension lengths ($16 \le 1024$) are within bounds, a 16-by-16 block easily satisfies the block limit. The primary constraint is that the total threads per block cannot exceed `maxThreadsPerBlock` (1024), and per-SM register and shared memory allocations must accommodate the active blocks.
+   - Since $256 \le 1024$, and each dimension length ($16 \le 1024$) is within bounds, a 16-by-16 block satisfies the block limits. The fundamental constraint is that total threads per block cannot exceed `maxThreadsPerBlock` (1024), and per-SM register and shared memory allocations must accommodate the active blocks.
 2. **Why is a grid with more blocks than SMs valid?**
    - GPUs decouple thread blocks from physical Streaming Multiprocessors (SMs). An SM can host multiple resident blocks simultaneously, and the hardware work distributor (GigaThread engine) schedules blocks onto SMs in **waves**. When a block finishes execution and releases resources, subsequent pending blocks from the grid are scheduled onto the newly available SMs until the entire grid completes.
 
@@ -65,15 +79,23 @@
 
 ## 5. Exercise 4 Analysis: Measure Kernel and Transfer-Inclusive Time
 
+### Experimental Measurements:
+| $n$ | CPU Baseline ($T_{\text{CPU}}$, ms) | GPU Kernel ($T_{\text{kernel}}$, ms) | Transfer-Inclusive ($T_{\text{operation}}$, ms) | Resident Speedup ($S_{\text{resident}}$) | Operation Speedup ($S_{\text{operation}}$) |
+|---|---|---|---|---|---|
+| **1,003** | 0.0002 ms | 0.0054 ms | 0.1892 ms | 0.041x | 0.001x |
+| **100,003** | 0.0169 ms | 0.0533 ms | 0.3974 ms | 0.317x | 0.042x |
+| **1,000,003** | 0.7191 ms | 0.0894 ms | 1.7074 ms | 8.043x | 0.421x |
+| **10,000,003** | 6.7354 ms | 0.5625 ms | 15.3785 ms | 11.973x | 0.438x |
+
 ### Speedup Definitions:
 - **Resident Speedup:** $S_{\text{resident}} = \frac{T_{\text{CPU}}}{T_{\text{kernel}}}$
 - **Operation Speedup:** $S_{\text{operation}} = \frac{T_{\text{CPU}}}{T_{\text{operation}}}$
 - Where $T_{\text{operation}} = T_{\text{H2D}} + T_{\text{kernel}} + T_{\text{sync}} + T_{\text{D2H}}$.
 
 ### Behavior & Analysis:
-- For small input sizes (e.g. $n = 1,003$), $S_{\text{operation}} < 1.0$ (negative speedup) because PCIe bus transfer latency (~5–15 $\mu$s) and CUDA runtime launch overhead dominate the minute compute time.
-- As problem size grows to $n = 10,000,003$, GPU arithmetic throughput and memory parallelism saturate the GPU memory controllers, leading to substantial resident-data speedup ($S_{\text{resident}} \gg 1.0$).
-- $S_{\text{resident}}$ measures compute efficiency assuming data already resides on device global memory (e.g. in multi-stage GPU pipelines), while $S_{\text{operation}}$ represents isolated end-to-end offloading costs.
+- For small input sizes ($n = 1,003$ and $100,003$), $S_{\text{operation}} \ll 1.0$ because PCIe transfer latency (~10–20 $\mu$s) and host dispatch overhead dominate the computation.
+- As problem size grows to $n = 10,000,003$, GPU arithmetic throughput and memory parallelism saturate the GPU memory controllers, leading to substantial resident-data speedup ($S_{\text{resident}} \approx 12.0\times$).
+- However, $S_{\text{operation}}$ stays around $0.44\times$ because vector addition has very low arithmetic intensity (1 flop per 12 bytes transferred). Offloading a single vector addition across PCIe is memory-bound and communication-dominated; GPU acceleration is advantageous when data remains on device across multiple compute stages.
 
 ---
 
@@ -81,23 +103,34 @@
 
 ### Grid-Stride Loop:
 $$\text{first} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}, \quad \text{stride} = \text{blockDim.x} \times \text{gridDim.x}$$
-$$\text{Effective Bandwidth} = \frac{12 \times n}{T_{\text{kernel}} \times 10^9} \text{ GB/s}$$
+$$\text{Effective Bandwidth} = \frac{12.0 \times n}{T_{\text{kernel}} \times 10^9} \text{ GB/s}$$
+
+### Grid Configuration Sweep ($n = 1,000,003$):
+| Blocks | Threads | Kernel Time (ms) | Effective Bandwidth (GB/s) |
+|---|---|---|---|
+| **64** | **64** | 0.1164 ms | 103.14 GB/s |
+| **64** | **128** | 0.0717 ms | 167.34 GB/s |
+| **64** | **256** | 0.0492 ms | 244.14 GB/s |
+| **128** | **64** | 0.0716 ms | 167.49 GB/s |
+| **128** | **128** | 0.0478 ms | 250.84 GB/s |
+| **128** | **256** | 0.0556 ms | 215.89 GB/s |
+| **256** | **64** | 0.0474 ms | **253.21 GB/s** |
+| **256** | **128** | 0.0558 ms | 214.90 GB/s |
+| **256** | **256** | 0.0500 ms | 240.08 GB/s |
 
 ### Insights:
-1. **Coalesced Memory Access:** Adjacent threads within a warp read consecutive 32-bit floats (`a[i]`, `a[i+1]`), allowing the GPU memory controller to combine 32 loads into a single coalesced 128-byte DRAM transaction.
-2. **Launch Configuration Sweeps:** Blocks (64, 128, 256) and Threads (64, 128, 256).
-   - Configurations with total active threads matching or exceeding the GPU's SM capacity sustain peak memory bandwidth.
-   - Overly small thread blocks (e.g. 64 threads = 2 warps) suffer from warp scheduler latency starvation, whereas 256 threads per block yields optimal occupancy.
+1. **Coalesced Memory Access:** Adjacent threads within a warp access adjacent 32-bit floats (`a[i]`, `a[i+1]`), combining memory requests into single 128-byte DRAM transactions.
+2. **Occupancy & Latency Hiding:** A configuration of 256 blocks with 64 threads per block achieved the highest effective bandwidth (253.21 GB/s), representing over 75% of the RTX 2060's theoretical peak memory bandwidth (336 GB/s).
 3. **Single-thread grid-stride launch:**
-   - A single thread with grid-stride loop can correctly compute all $n$ elements serially on the GPU, but it achieves negligible throughput because it underutilizes the thousands of parallel GPU cores.
+   - A single thread with a grid-stride loop can compute all elements serially on the GPU, but it yields negligible throughput because only 1 of 1,920 hardware CUDA cores is active, providing no latency hiding or parallel memory access.
 
 ---
 
 ## 7. Exercise 6 Analysis: Reduce a Vector with Shared Memory
 
-### Halving Algorithm:
-- Each block reduces 256 elements in `__shared__ int values[256]` via iterative halving (`offset = BLOCK / 2; offset > 0; offset /= 2`).
-- Partial block sums are copied to `partial[blockIdx.x]`, and the final sum is aggregated.
+### Halving Algorithm Verification:
+- All edge sizes ($n = 1, 255, 256, 257, 1000003$) verified against CPU reference: `match=yes`.
+- For $n=1,000,003$: `expected=3000003 result=3000003 match=yes`.
 
 ### Investigation Questions:
 1. **Why `BLOCK=192` breaks the halving algorithm:**
@@ -114,13 +147,19 @@ $$\text{Effective Bandwidth} = \frac{12 \times n}{T_{\text{kernel}} \times 10^9}
 
 $$\text{GFLOP/s} = \frac{2 \times M \times K \times N}{T_{\text{kernel}} \times 10^9}$$
 
-### Naive vs Tiled Implementation:
-- **Naive Kernel:** Every thread computes one element of $C$, performing $K$ global memory loads from $A$ and $K$ global memory loads from $B$. Total global memory accesses: $2 \times M \times N \times K$.
-- **Tiled Kernel:** Threads collaboratively load $16 \times 16$ submatrices into fast `__shared__` memory tiles (`a_tile` and `b_tile`). Each element loaded from global memory is reused 16 times within the block's registers before the next tile is loaded, reducing global memory traffic by a factor of 16.
-- **Two Barriers per Phase:**
-  1. `__syncthreads()` #1: Ensures both tiles are fully loaded before threads compute partial dot products.
-  2. `__syncthreads()` #2: Ensures all threads finish computing with the current tile before any thread overwrites the tile in the next phase.
-- **Small Matrix Anomaly:** For very small matrices (e.g. $8 \times 8$), tiled multiplication can be slower than naive multiplication because shared memory allocation, loop overhead, and barrier synchronization latency outweigh the memory bandwidth savings.
+### Performance Comparison:
+| Shape ($M \times K \times N$) | Naive Time (ms) | Naive GFLOP/s | Tiled Time (ms) | Tiled GFLOP/s | Speedup ($T_{\text{naive}} / T_{\text{tiled}}$) |
+|---|---|---|---|---|---|
+| **$8 \times 8 \times 8$** | 0.0059 ms | 0.17 | 0.0061 ms | 0.17 | **0.96x** |
+| **$15 \times 15 \times 15$** | 0.0063 ms | 1.08 | 0.0060 ms | 1.13 | **1.05x** |
+| **$127 \times 130 \times 129$** | 0.0187 ms | 228.32 | 0.0185 ms | 230.70 | **1.01x** |
+| **$128 \times 128 \times 128$** | 0.0225 ms | 186.18 | 0.0169 ms | 248.71 | **1.34x** |
+| **$256 \times 256 \times 256$** | 0.0991 ms | 338.58 | 0.0696 ms | 482.10 | **1.42x** |
+| **$512 \times 512 \times 512$** | 0.6821 ms | 393.54 | 0.4400 ms | 610.04 | **1.55x** |
+
+### Insights:
+- **Small Matrix Anomaly ($8 \times 8 \times 8$):** The tiled implementation is slightly slower (0.96x) because overhead from shared memory tile loading and two `__syncthreads()` barriers outweighs the minimal global memory bandwidth savings for 64 elements.
+- **Large Square Matrices ($512 \times 512 \times 512$):** Tiling reduces global memory traffic by a factor of 16 ($16 \times 16$ tile reuse), boosting throughput from 393.54 GFLOP/s to **610.04 GFLOP/s** (a 1.55x speedup).
 
 ---
 
@@ -129,11 +168,9 @@ $$\text{GFLOP/s} = \frac{2 \times M \times K \times N}{T_{\text{kernel}} \times 
 ### 1. `vector_add_nobounds.cu` (Memcheck):
 - Removing `if (i < n)` with $n=257$, `threads=256` results in 2 blocks ($2 \times 256 = 512$ threads).
 - Threads $257 \dots 511$ access `d_a[i]`, `d_b[i]`, and `d_c[i]`.
-- `compute-sanitizer --tool memcheck` immediately reports:
-  `Invalid __global__ read of size 4 at <address> by thread (1,0,0) in block (1,0,0)`.
+- Diagnostic explanation: Threads beyond index 256 cause out-of-bounds global memory reads and writes, detected by `compute-sanitizer --tool memcheck` as `Invalid __global__ read of size 4`.
 
 ### 2. `reduce_sum_nobarrier.cu` (Racecheck):
 - Removing the first `__syncthreads()` creates a Read-After-Write (RAW) / Write-After-Read (WAR) race hazard:
-- Faster threads entering the reduction loop read `values[t + offset]` before slower threads have written `values[t] = a[i]`.
-- `compute-sanitizer --tool racecheck` flags:
-  `Hazard WAR/RAW on shared memory at values[t + offset] between threads`.
+- Faster threads entering the reduction loop read `values[t + offset]` before slower threads have finished writing `values[t] = a[i]`.
+- Diagnostic explanation: `compute-sanitizer --tool racecheck` detects hazards on shared memory between threads within the same thread block.
